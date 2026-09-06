@@ -1,0 +1,23 @@
+# .gitignore for clouddbRemapPlayer
+#
+# Simpler than the other three trees (clouddbGoLauncher/clouddbSEA/clouddbGo)
+# — no embedded payload, no build-output folders to worry about. Just the
+# standard Go pattern plus this tool's own test artifacts.
+
+# Build output
+/clouddb-remap-player.exe
+*.exe
+
+# go.sum is intentionally NOT ignored — track it once `go mod tidy` (see
+# BUILD.md step 2) generates it, same reasoning as any other Go module:
+# reproducible builds depend on the exact resolved dependency checksums
+# being committed, not regenerated fresh by whoever clones this later.
+
+# Test artifacts from BUILD.md's step 4 (testing against a copy, never the
+# live database) — never commit a real or test SQLite file, and never
+# commit the tool's own automatic backups.
+test-cloudstorage.db
+*.db
+*.db-wal
+*.db-shm
+*.bak
