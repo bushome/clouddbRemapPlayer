@@ -7,23 +7,35 @@
 // nothing can address it anymore. This tool remaps
 // DedicatedStorage.ownerId from an old value to a new one.
 //
-// Built as a standalone Go binary using a pure-Go SQLite driver
-// (modernc.org/sqlite — no cgo, no native compilation, no .node/.dll
-// binary at all) specifically to avoid the entire native-addon-ABI bug
-// class documented in CLAUDE.md's SqliteResilienceService section. This
-// tool is run rarely and by hand, so there's no reason to carry that risk
-// for it even though the underlying app itself no longer does either
-// (having migrated to @prisma/adapter-libsql for the same reason).
+// Supports both backends this project ships: SQLite (the solo-player
+// Go-launcher target) and MySQL/MariaDB (the cluster-operator SEA
+// target). Both drivers used here are pure Go — modernc.org/sqlite and
+// github.com/go-sql-driver/mysql — no cgo, no native .node/.dll binary
+// at all, specifically to avoid the entire native-addon-ABI bug class
+// documented in CLAUDE.md's SqliteResilienceService section. This tool
+// is run rarely and by hand, so there's no reason to carry that risk for
+// it even though the underlying app itself no longer does either (having
+// migrated to @prisma/adapter-libsql for the same reason).
 //
 // Usage:
 //   clouddb-remap-player.exe                                    (fully interactive)
 //   clouddb-remap-player.exe -db path\to\cloudstorage.db
 //   clouddb-remap-player.exe -db path\to\cloudstorage.db -old 123456 -new 789012
+//   clouddb-remap-player.exe -mysql
+//   clouddb-remap-player.exe -mysql -host db.example.com -port 3306 -user root -password secret -database clouddb
+//
+// Connection details (whichever backend you use) are saved to
+// remap-player-credentials.json next to this exe after your first
+// successful run, so you won't be asked again on future runs. Delete
+// that file any time you want to be asked again (e.g. after a password
+// change) — there's no separate "update credentials" flow, that's the
+// whole reset story. Pass -no-save to skip saving for a single run.
 package main
 
 import (
 	"bufio"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -33,6 +45,7 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	_ "modernc.org/sqlite"
 )
 
@@ -44,56 +57,166 @@ func main() {
 	os.Exit(code)
 }
 
+// mysqlCredentials holds everything needed to open a MySQL/MariaDB
+// connection.
+type mysqlCredentials struct {
+	Host     string `json:"Host"`
+	Port     int    `json:"Port"`
+	User     string `json:"User"`
+	Password string `json:"Password"`
+	Database string `json:"Database"`
+}
+
+// savedCredentials is the on-disk shape of remap-player-credentials.json.
+// Only one of SQLitePath/MySQL is meaningful at a time, based on DBType —
+// this mirrors config.json's own DTO shape (a SQLite block and a MySQL
+// block coexisting, with UseMySQL deciding which one matters) rather than
+// inventing a different convention just for this tool.
+type savedCredentials struct {
+	DBType     string             `json:"DBType"` // "sqlite" or "mysql"
+	SQLitePath string             `json:"SQLitePath,omitempty"`
+	MySQL      *mysqlCredentials  `json:"MySQL,omitempty"`
+}
+
+// credentialsFilePath resolves next to the exe itself, not the current
+// working directory — same "config sits alongside the app" convention
+// used everywhere else in this project (config.json, watchdog-config.json).
+func credentialsFilePath() string {
+	exePath, err := os.Executable()
+	dir := "."
+	if err == nil {
+		dir = filepath.Dir(exePath)
+	}
+	return filepath.Join(dir, "remap-player-credentials.json")
+}
+
+func loadSavedCredentials() (*savedCredentials, error) {
+	path := credentialsFilePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var creds savedCredentials
+	if err := json.Unmarshal(data, &creds); err != nil {
+		return nil, fmt.Errorf("credentials file at %s is not valid JSON: %w", path, err)
+	}
+	return &creds, nil
+}
+
+func saveCredentials(creds savedCredentials) error {
+	data, err := json.MarshalIndent(creds, "", "  ")
+	if err != nil {
+		return err
+	}
+	// 0600: local recovery-tool credentials, same trust model as
+	// config.json elsewhere in this project — readable only by whoever
+	// has filesystem access to this machine already.
+	return os.WriteFile(credentialsFilePath(), data, 0600)
+}
+
 func run() int {
-	dbPathFlag := flag.String("db", "", "Path to cloudstorage.db (prompted if omitted)")
+	dbFlag := flag.String("db", "", "Path to cloudstorage.db for SQLite mode (prompted if omitted; mutually exclusive with -mysql)")
+	mysqlFlag := flag.Bool("mysql", false, "Connect to MySQL/MariaDB instead of SQLite")
+	hostFlag := flag.String("host", "", "MySQL host (prompted if omitted and not already saved)")
+	portFlag := flag.Int("port", 0, "MySQL port (default 3306; prompted if omitted and not already saved)")
+	userFlag := flag.String("user", "", "MySQL user (prompted if omitted and not already saved)")
+	passwordFlag := flag.String("password", "", "MySQL password (prompted if omitted and not already saved)")
+	databaseFlag := flag.String("database", "", "MySQL database name (prompted if omitted and not already saved)")
+	noSaveFlag := flag.Bool("no-save", false, "Don't save connection details to remap-player-credentials.json")
 	oldIDFlag := flag.String("old", "", "Old PlayerId to migrate FROM (prompted if omitted)")
 	newIDFlag := flag.String("new", "", "New PlayerId to migrate TO (prompted if omitted)")
 	flag.Parse()
 
 	reader := bufio.NewReader(os.Stdin)
 
-	dbPath := *dbPathFlag
-	if dbPath == "" {
-		dbPath = promptForDBPath(reader)
-	}
-
-	absPath, err := filepath.Abs(dbPath)
+	saved, err := loadSavedCredentials()
 	if err != nil {
-		return fail("Could not resolve database path: %v", err)
+		return fail("Could not read %s: %v\nDelete this file and run the tool again to reset it.",
+			filepath.Base(credentialsFilePath()), err)
 	}
-	dbPath = absPath
 
-	if info, err := os.Stat(dbPath); err != nil {
-		return fail("Database file not found at %s: %v", dbPath, err)
-	} else if info.IsDir() {
-		resolved, err := resolveDBPathFromFolder(dbPath, reader)
+	dbType, err := determineDBType(reader, *dbFlag, *mysqlFlag, saved)
+	if err != nil {
+		return fail("%v", err)
+	}
+
+	var db *sql.DB
+	var backupPath string
+
+	if dbType == "mysql" {
+		creds := resolveMySQLCredentials(reader, *hostFlag, *portFlag, *userFlag, *passwordFlag, *databaseFlag, saved)
+
+		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", creds.User, creds.Password, creds.Host, creds.Port, creds.Database)
+		db, err = sql.Open("mysql", dsn)
 		if err != nil {
-			return fail("%v", err)
+			return fail("Failed to open MySQL connection: %v", err)
 		}
-		dbPath = resolved
-	}
+		defer db.Close()
 
-	fmt.Println()
-	fmt.Println("IMPORTANT: make sure the Cloud Storage server/launcher is NOT")
-	fmt.Println("running right now. Running this tool while the app is writing")
-	fmt.Println("to the same database file at the same time can corrupt it.")
-	fmt.Print("Type YES to confirm the app is stopped and continue: ")
-	if !readYes(reader) {
-		fmt.Println("Aborted — nothing was changed.")
-		return 0
-	}
+		if err := db.Ping(); err != nil {
+			return fail("Could not connect to MySQL at %s:%d as %s: %v", creds.Host, creds.Port, creds.User, err)
+		}
 
-	backupPath, err := backupDatabase(dbPath)
-	if err != nil {
-		return fail("Failed to create a backup before proceeding: %v", err)
-	}
-	fmt.Printf("Backup created: %s\n", backupPath)
+		backupPath, err = backupMySQLDatabase(db, creds.Database)
+		if err != nil {
+			return fail("Failed to create a backup before proceeding: %v", err)
+		}
+		fmt.Printf("Backup created: %s\n", backupPath)
 
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return fail("Failed to open database: %v", err)
+		if !*noSaveFlag && saved == nil {
+			maybeSaveCredentials(reader, savedCredentials{DBType: "mysql", MySQL: &creds})
+		}
+	} else {
+		dbPath := *dbFlag
+		if dbPath == "" {
+			dbPath = promptForDBPath(reader, saved)
+		}
+
+		absPath, absErr := filepath.Abs(dbPath)
+		if absErr != nil {
+			return fail("Could not resolve database path: %v", absErr)
+		}
+		dbPath = absPath
+
+		if info, statErr := os.Stat(dbPath); statErr != nil {
+			return fail("Database file not found at %s: %v", dbPath, statErr)
+		} else if info.IsDir() {
+			resolved, resolveErr := resolveDBPathFromFolder(dbPath, reader)
+			if resolveErr != nil {
+				return fail("%v", resolveErr)
+			}
+			dbPath = resolved
+		}
+
+		fmt.Println()
+		fmt.Println("IMPORTANT: make sure the Cloud Storage server/launcher is NOT")
+		fmt.Println("running right now. Running this tool while the app is writing")
+		fmt.Println("to the same database file at the same time can corrupt it.")
+		fmt.Print("Type YES to confirm the app is stopped and continue: ")
+		if !readYes(reader) {
+			fmt.Println("Aborted — nothing was changed.")
+			return 0
+		}
+
+		backupPath, err = backupDatabase(dbPath)
+		if err != nil {
+			return fail("Failed to create a backup before proceeding: %v", err)
+		}
+		fmt.Printf("Backup created: %s\n", backupPath)
+
+		db, err = sql.Open("sqlite", dbPath)
+		if err != nil {
+			return fail("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		if !*noSaveFlag && saved == nil {
+			maybeSaveCredentials(reader, savedCredentials{DBType: "sqlite", SQLitePath: dbPath})
+		}
 	}
-	defer db.Close()
 
 	if err := printOwnerSummary(db); err != nil {
 		return fail("Failed to read DedicatedStorage: %v", err)
@@ -131,7 +254,12 @@ func run() int {
 		return 0
 	}
 
-	merged, moved, err := remapOwner(db, oldID, newID)
+	var merged, moved int
+	if dbType == "mysql" {
+		merged, moved, err = remapOwnerMySQL(db, oldID, newID)
+	} else {
+		merged, moved, err = remapOwnerSQLite(db, oldID, newID)
+	}
 	if err != nil {
 		return fail("Migration failed: %v\nYour original data is safe in the backup: %s", err, backupPath)
 	}
@@ -139,6 +267,132 @@ func run() int {
 	fmt.Println()
 	fmt.Printf("Done. %d row(s) merged into existing entries, %d row(s) moved directly.\n", merged, moved)
 	fmt.Println("If anything looks wrong, restore from the backup file listed above.")
+	return 0
+}
+
+// determineDBType figures out which backend to use for this run, in this
+// order of precedence: an explicit -db (SQLite) or -mysql flag always
+// wins; failing that, a previously saved credentials file's DBType is
+// used automatically; failing that, the player is asked directly.
+func determineDBType(reader *bufio.Reader, dbFlag string, mysqlFlag bool, saved *savedCredentials) (string, error) {
+	if mysqlFlag && dbFlag != "" {
+		return "", fmt.Errorf("-db and -mysql can't both be set — pick one backend")
+	}
+	if mysqlFlag {
+		return "mysql", nil
+	}
+	if dbFlag != "" {
+		return "sqlite", nil
+	}
+	if saved != nil && (saved.DBType == "sqlite" || saved.DBType == "mysql") {
+		return saved.DBType, nil
+	}
+
+	for {
+		fmt.Println("Which database is this cluster using?")
+		fmt.Println("  [1] SQLite (solo-player Go-launcher)")
+		fmt.Println("  [2] MySQL/MariaDB (cluster operator)")
+		fmt.Print("Enter 1 or 2: ")
+		line, _ := reader.ReadString('\n')
+		switch strings.TrimSpace(line) {
+		case "1":
+			return "sqlite", nil
+		case "2":
+			return "mysql", nil
+		default:
+			fmt.Println("  Not a valid choice — try again.")
+		}
+	}
+}
+
+// maybeSaveCredentials offers to persist connection details after a
+// successful connection, only when nothing was already saved (an
+// existing saved file is never silently overwritten — deleting it is the
+// deliberate reset action, per this tool's design).
+func maybeSaveCredentials(reader *bufio.Reader, toSave savedCredentials) {
+	fmt.Print("\nSave these connection details for next time? [Y/n]: ")
+	line, _ := reader.ReadString('\n')
+	if strings.EqualFold(strings.TrimSpace(line), "n") {
+		return
+	}
+	if err := saveCredentials(toSave); err != nil {
+		fmt.Printf("(Could not save credentials: %v — you'll be asked again next time.)\n", err)
+		return
+	}
+	fmt.Printf("Saved to %s. Delete that file any time to be asked again (e.g. after a password change).\n",
+		filepath.Base(credentialsFilePath()))
+}
+
+// resolveMySQLCredentials builds the connection details to use, in this
+// order of precedence per field: an explicit flag always wins; failing
+// that, a previously saved value; failing that, the player is prompted.
+// This means a player can override just one saved field via a flag (e.g.
+// a new password after a rotation) without retyping everything else.
+func resolveMySQLCredentials(reader *bufio.Reader, hostFlag string, portFlag int, userFlag, passwordFlag, databaseFlag string, saved *savedCredentials) mysqlCredentials {
+	var existing mysqlCredentials
+	if saved != nil && saved.MySQL != nil {
+		existing = *saved.MySQL
+	}
+
+	creds := mysqlCredentials{
+		Host:     firstNonEmpty(hostFlag, existing.Host),
+		Port:     firstNonZero(portFlag, existing.Port),
+		User:     firstNonEmpty(userFlag, existing.User),
+		Password: firstNonEmpty(passwordFlag, existing.Password),
+		Database: firstNonEmpty(databaseFlag, existing.Database),
+	}
+
+	if creds.Host == "" {
+		fmt.Print("MySQL host: ")
+		line, _ := reader.ReadString('\n')
+		creds.Host = strings.TrimSpace(line)
+	}
+	if creds.Port == 0 {
+		fmt.Print("MySQL port [3306]: ")
+		line, _ := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line == "" {
+			creds.Port = 3306
+		} else if p, err := strconv.Atoi(line); err == nil {
+			creds.Port = p
+		} else {
+			creds.Port = 3306
+		}
+	}
+	if creds.User == "" {
+		fmt.Print("MySQL user: ")
+		line, _ := reader.ReadString('\n')
+		creds.User = strings.TrimSpace(line)
+	}
+	if creds.Password == "" {
+		fmt.Print("MySQL password: ")
+		line, _ := reader.ReadString('\n')
+		creds.Password = strings.TrimSpace(line)
+	}
+	if creds.Database == "" {
+		fmt.Print("MySQL database name: ")
+		line, _ := reader.ReadString('\n')
+		creds.Database = strings.TrimSpace(line)
+	}
+
+	return creds
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func firstNonZero(values ...int) int {
+	for _, v := range values {
+		if v != 0 {
+			return v
+		}
+	}
 	return 0
 }
 
@@ -202,11 +456,16 @@ func resolveDBPathFromFolder(folder string, reader *bufio.Reader) (string, error
 	}
 }
 
-func promptForDBPath(reader *bufio.Reader) string {
-	exePath, err := os.Executable()
-	defaultPath := "data\\cloudstorage.db"
-	if err == nil {
-		defaultPath = filepath.Join(filepath.Dir(exePath), "data", "cloudstorage.db")
+func promptForDBPath(reader *bufio.Reader, saved *savedCredentials) string {
+	defaultPath := ""
+	if saved != nil && saved.SQLitePath != "" {
+		defaultPath = saved.SQLitePath
+	} else {
+		exePath, err := os.Executable()
+		defaultPath = "data\\cloudstorage.db"
+		if err == nil {
+			defaultPath = filepath.Join(filepath.Dir(exePath), "data", "cloudstorage.db")
+		}
 	}
 
 	fmt.Printf("Path to cloudstorage.db [%s]: ", defaultPath)
@@ -258,6 +517,67 @@ func backupDatabase(dbPath string) (string, error) {
 	return backupPath, nil
 }
 
+// backupMySQLDatabase makes a best-effort logical backup of the entire
+// DedicatedStorage table before any change is made — no flag to skip
+// this, same "unconditional" principle as the SQLite path's file copy.
+// Unlike SQLite, there's no single file to copy for a networked
+// database, so this writes out every existing row as a plain SQL script
+// (using INSERT ... ON DUPLICATE KEY UPDATE, so replaying it restores
+// original amounts even if a row still exists) that can be run by hand
+// via any MySQL client if a restore is ever needed.
+//
+// This is a safety net for manual recovery, not a one-click restore the
+// way the SQLite backup file is — worth knowing before relying on it.
+func backupMySQLDatabase(db *sql.DB, databaseName string) (string, error) {
+	rows, err := db.Query(`SELECT clusterId, ownerId, resourceId, amount FROM DedicatedStorage`)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	timestamp := time.Now().Format("2006-01-02T15-04-05")
+	backupPath := fmt.Sprintf("%s.pre-remap.%s.sql", databaseName, timestamp)
+
+	f, err := os.Create(backupPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "-- DedicatedStorage backup taken %s before a remap-player run.\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(f, "-- To restore a row, run the matching statement below against the '%s' database.\n\n", databaseName)
+
+	rowCount := 0
+	for rows.Next() {
+		var clusterID, ownerID, resourceID string
+		var amount int64
+		if err := rows.Scan(&clusterID, &ownerID, &resourceID, &amount); err != nil {
+			return "", err
+		}
+		fmt.Fprintf(f,
+			"INSERT INTO DedicatedStorage (clusterId, ownerId, resourceId, amount) VALUES (%s, %s, %s, %d) "+
+				"ON DUPLICATE KEY UPDATE amount = VALUES(amount);\n",
+			quoteSQL(clusterID), quoteSQL(ownerID), quoteSQL(resourceID), amount,
+		)
+		rowCount++
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+
+	fmt.Fprintf(f, "\n-- %d row(s) backed up.\n", rowCount)
+	return backupPath, nil
+}
+
+// quoteSQL does minimal single-quote escaping for embedding string
+// values into the backup script above. This tool only ever writes
+// clusterId/ownerId/resourceId values that originated from this same
+// database, so this is a safety net against stray quote characters, not
+// a defense against untrusted input.
+func quoteSQL(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
 func printOwnerSummary(db *sql.DB) error {
 	rows, err := db.Query(`
 		SELECT ownerId, COUNT(*) AS rowCount, SUM(amount) AS totalItems
@@ -297,18 +617,25 @@ func countRows(db *sql.DB, ownerID string) (int, error) {
 	return count, err
 }
 
-// remapOwner moves every DedicatedStorage row from oldID to newID.
+// remapOwnerSQLite moves every DedicatedStorage row from oldID to newID.
 //
-// Rows that collide on (clusterId, resourceId) under newID — the expected,
-// common case for a player recovering access on a server they were
-// already active on, not an edge case: clusterId is unchanged and
+// Rows that collide on (clusterId, resourceId) under newID — the
+// expected, common case for a player recovering access on a server they
+// were already active on, not an edge case: clusterId is unchanged and
 // resourceId is drawn from ARK's fixed set of resource types, so overlap
-// between old and new rows is likely — have their amounts SUMMED into the
-// existing newID row, and the oldID row is then deleted. Rows with no
-// collision are moved directly via a plain UPDATE. The whole operation
-// runs inside one transaction, so a failure partway through leaves the
-// database in its original state rather than a half-migrated one.
-func remapOwner(db *sql.DB, oldID, newID string) (merged int, moved int, err error) {
+// between old and new rows is likely — have their amounts SUMMED into
+// the existing newID row, and the oldID row is then deleted. Rows with
+// no collision are moved directly via a plain UPDATE. The whole
+// operation runs inside one transaction, so a failure partway through
+// leaves the database in its original state rather than a
+// half-migrated one.
+//
+// See remapOwnerMySQL for the MySQL/MariaDB equivalent — the two can't
+// share one query set, because MySQL rejects a subquery that selects
+// from the same table being updated/deleted in that statement (see that
+// function's comment for the specific error and why a JOIN-based
+// rewrite is needed there instead).
+func remapOwnerSQLite(db *sql.DB, oldID, newID string) (merged int, moved int, err error) {
 	tx, err := db.Begin()
 	if err != nil {
 		return 0, 0, err
@@ -360,6 +687,76 @@ func remapOwner(db *sql.DB, oldID, newID string) (merged int, moved int, err err
 	// Step 3: everything remaining under oldID had no collision — safe to
 	// move directly without violating the (clusterId, ownerId, resourceId)
 	// primary key.
+	moveResult, err := tx.Exec(`
+		UPDATE DedicatedStorage SET ownerId = ? WHERE ownerId = ?
+	`, newID, oldID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("moving non-colliding rows: %w", err)
+	}
+	movedCount, _ := moveResult.RowsAffected()
+
+	if err = tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("committing transaction: %w", err)
+	}
+
+	return int(mergedCount), int(movedCount), nil
+}
+
+// remapOwnerMySQL performs the same logical migration as remapOwnerSQLite
+// (see its comment for the full merge/move reasoning), but uses MySQL's
+// multi-table UPDATE/DELETE ... JOIN syntax instead of the SQLite
+// version's correlated subqueries.
+//
+// MySQL rejects a subquery that selects from the same table being
+// updated or deleted in that same statement — error 1093, "You can't
+// specify target table 'DedicatedStorage' for update in FROM clause."
+// A JOIN-based multi-table statement sidesteps that restriction entirely
+// (both table references are explicit in the UPDATE/DELETE's own JOIN
+// clause rather than a nested subquery) and is the standard MySQL idiom
+// for this kind of self-referencing update.
+func remapOwnerMySQL(db *sql.DB, oldID, newID string) (merged int, moved int, err error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// Step 1: same merge as the SQLite version, expressed as a multi-table
+	// UPDATE ... JOIN instead of a correlated subquery.
+	mergeResult, err := tx.Exec(`
+		UPDATE DedicatedStorage AS newRow
+		JOIN DedicatedStorage AS oldRow
+		  ON oldRow.clusterId = newRow.clusterId
+		 AND oldRow.resourceId = newRow.resourceId
+		 AND oldRow.ownerId = ?
+		SET newRow.amount = newRow.amount + oldRow.amount
+		WHERE newRow.ownerId = ?
+	`, oldID, newID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("merging colliding rows: %w", err)
+	}
+	mergedCount, _ := mergeResult.RowsAffected()
+
+	// Step 2: remove the now-redundant oldID rows that were just merged
+	// in, via a multi-table DELETE ... JOIN.
+	if _, err = tx.Exec(`
+		DELETE oldRow FROM DedicatedStorage AS oldRow
+		JOIN DedicatedStorage AS newRow
+		  ON newRow.ownerId = ?
+		 AND newRow.clusterId = oldRow.clusterId
+		 AND newRow.resourceId = oldRow.resourceId
+		WHERE oldRow.ownerId = ?
+	`, newID, oldID); err != nil {
+		return 0, 0, fmt.Errorf("removing merged old rows: %w", err)
+	}
+
+	// Step 3: everything remaining under oldID had no collision — safe to
+	// move directly. No subquery involved here, so this is identical to
+	// the SQLite version.
 	moveResult, err := tx.Exec(`
 		UPDATE DedicatedStorage SET ownerId = ? WHERE ownerId = ?
 	`, newID, oldID)
