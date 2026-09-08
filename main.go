@@ -410,11 +410,7 @@ func readYes(reader *bufio.Reader) bool {
 // clouddbGoLauncher/clouddbGo actually use in practice, and only falls
 // back to asking the player to type an exact path if none of those match.
 func resolveDBPathFromFolder(folder string, reader *bufio.Reader) (string, error) {
-	candidates := []string{
-		filepath.Join(folder, "cloudstorage.db"),
-		filepath.Join(folder, "data", "cloudstorage.db"),
-		filepath.Join(folder, "app", "data", "cloudstorage.db"),
-	}
+	candidates := dbPathCandidates(folder)
 
 	var found []string
 	for _, c := range candidates {
@@ -456,15 +452,55 @@ func resolveDBPathFromFolder(folder string, reader *bufio.Reader) (string, error
 	}
 }
 
+// dbPathCandidates returns the known locations a cloudstorage.db file
+// might live relative to dir, covering every deployment layout this
+// project actually ships (a plain SQLite file next to dir, the
+// Deployables/NodeJS-style data/ subfolder, and clouddbGoLauncher's own
+// extracted app/data/ subfolder). Single source of truth for both
+// findExistingDBCandidate's default-suggestion guess and
+// resolveDBPathFromFolder's fallback search — these two used to carry
+// separate, silently-diverged copies of this list, which is exactly how
+// the launcher-relative path went unrecognized by the default guess
+// despite already being known to the fallback search.
+func dbPathCandidates(dir string) []string {
+	return []string{
+		filepath.Join(dir, "cloudstorage.db"),
+		filepath.Join(dir, "data", "cloudstorage.db"),
+		filepath.Join(dir, "app", "data", "cloudstorage.db"),
+	}
+}
+
+// findExistingDBCandidate checks dbPathCandidates in order, returning the
+// first one that actually exists on disk. Used by promptForDBPath to
+// suggest a default that's actually correct for the layout it's running
+// from, rather than a single hardcoded guess that only matches one of
+// several real deployment shapes.
+func findExistingDBCandidate(dir string) string {
+	for _, c := range dbPathCandidates(dir) {
+		if info, err := os.Stat(c); err == nil && !info.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
 func promptForDBPath(reader *bufio.Reader, saved *savedCredentials) string {
 	defaultPath := ""
 	if saved != nil && saved.SQLitePath != "" {
 		defaultPath = saved.SQLitePath
 	} else {
 		exePath, err := os.Executable()
-		defaultPath = "data\\cloudstorage.db"
+		exeDir := "."
 		if err == nil {
-			defaultPath = filepath.Join(filepath.Dir(exePath), "data", "cloudstorage.db")
+			exeDir = filepath.Dir(exePath)
+		}
+		if found := findExistingDBCandidate(exeDir); found != "" {
+			defaultPath = found
+		} else {
+			// No known layout matched — fall back to the original guess
+			// rather than suggesting nothing, since this is still the
+			// most likely path for a from-source dev-tree build.
+			defaultPath = filepath.Join(exeDir, "data", "cloudstorage.db")
 		}
 	}
 
