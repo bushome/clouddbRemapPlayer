@@ -39,7 +39,7 @@ Same as the launcher — go1.22+ from https://go.dev/dl/, confirm with
 ## 2. Resolve dependencies
 
 ```powershell
-cd C:\Dev\clouddbRemapPlayer
+cd "C:\Dev\ARK CLOUD DEDICATED STORAGE API - No OverFlow\clouddbRemapPlayer"
 go mod tidy
 ```
 
