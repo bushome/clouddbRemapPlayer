@@ -52,7 +52,7 @@ Same as the launcher https://github.com/bushome/clouddbGoLauncher — go1.22+ fr
 ## 2. Resolve dependencies
 
 ```powershell
-cd "C:\Dev\ARK CLOUD DEDICATED STORAGE API - No OverFlow\clouddbRemapPlayer"
+cd "C:\ARK CLOUD DEDICATED STORAGE API - No OverFlow\clouddbRemapPlayer"
 go mod tidy
 ```
 
@@ -130,8 +130,7 @@ Walk through the prompts:
 
 ### MySQL/MariaDB path
 
-Test against `arktest_clouddb` (the existing isolated MariaDB sandbox
-already used elsewhere in this project) — never a production database —
+Test against a testing database copy of your `Cloud Storage database` — never a production database —
 until you've confirmed the tool behaves as expected:
 
 ```powershell
@@ -183,10 +182,10 @@ Regardless of which backend you tested above:
 
 ### Linux binary — verified via WSL2 (2026-09-07)
 
-Confirmed working end-to-end, not just a valid cross-compile: WSL2 was
-already present on the workstation from the Docker Desktop setup (see
-the main project docs' Docker section), so no separate Linux machine or
-VM was needed. From a WSL2 Ubuntu shell:
+YOU WILL NEED WSL2 IF ON WINDOWS FOR TESTING LINUX DISTRIBUTIONS. 
+was already present on the workstation from the Docker Desktop setup ( see
+the main project docs' Docker section, https://github.com/bushome/ark-cloud-storage-no-overflow/wiki/Docker-Deployment )
+From a WSL2 Ubuntu shell:
 ```bash
 cp /mnt/c/path/to/clouddb-remap-player ~/
 chmod +x ~/clouddb-remap-player
