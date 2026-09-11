@@ -27,9 +27,7 @@ platform, same "download one file, run it" philosophy as
 (deliberately) **no native database addon at all on either backend**:
 this uses `modernc.org/sqlite` and `github.com/go-sql-driver/mysql`, both
 pure-Go drivers with no `cgo`/native compilation step, specifically to
-avoid the entire class of native-addon-ABI bug documented in CLAUDE.md's
-SqliteResilienceService section. A tool this small and infrequently run
-has no reason to carry that risk, on either database.
+avoid the entire class of native-addon-ABI.
 
 Being pure Go with zero `cgo` on either backend also has a second
 benefit: **cross-compiling a native Linux binary needs no extra
