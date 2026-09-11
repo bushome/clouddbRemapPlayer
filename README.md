@@ -120,7 +120,7 @@ Walk through the prompts:
    right against what you know is really in the test file.
 4. Enter an old and new PlayerId. Try this against IDs you know will
    **collide** on at least one `(clusterId, resourceId)` pair (the common,
-   expected case per CLAUDE.md's design note) — verify the reported
+   — verify the reported
    merged-vs-moved counts make sense, and manually check the resulting
    database that colliding amounts were actually **summed**, not
    overwritten or duplicated.
