@@ -46,7 +46,7 @@ them worth a common module.
 
 ## 1. Install Go
 
-Same as the launcher — go1.22+ from https://go.dev/dl/, confirm with
+Same as the launcher https://github.com/bushome/clouddbGoLauncher — go1.22+ from https://go.dev/dl/, confirm with
 `go version`.
 
 ## 2. Resolve dependencies
