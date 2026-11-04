@@ -239,3 +239,8 @@ a safety net regardless.
 - **Only remaps `DedicatedStorage.ownerId`** — confirmed against the
   schema (both backends) that no other column/table keys on PlayerId in
   a way that would also need remapping.
+
+  ## Development
+
+Developed with AI assistance (Claude). Every change was reviewed and tested on a dedicated test server
+before going live.
